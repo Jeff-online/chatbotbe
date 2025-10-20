@@ -9,7 +9,8 @@ from . import system_api
 from . args_parser import *
 from flask import current_app
 from datetime import datetime, timedelta
-from utils.file_utils import FileOperation
+from utils.file_utils import FileOperation, cal_tokens
+from .args_parser import CheckTokenParser
 from werkzeug.utils import secure_filename
 from common.common_resource import GlobalResource, Resource
 logger = logging.getLogger(__name__)
@@ -557,7 +558,43 @@ class TestMultiFile(GlobalResource):
             return {"message in the check name function after FileOperation": str(e), "status": 404,"attachment_name_type":type(attachment_name)}
         return clue, file_content
 
+class CheckToken(GlobalResource):
+    """检查文件token数量的类"""
+    
+    def post(self):
+        """检查文件token数量"""
+        args_parser = CheckTokenParser()
+        args = args_parser.parser.parse_args()
+        username = args.get("username")
+        attachment_names = args.get("attachment_names")
+        deploy_model = args.get("deploy_model", "gpt-4o")  # 默认使用gpt-4o
+        
+        if not username:
+            raise messages.UserNameNotExistsError
+            
+        if not attachment_names or not isinstance(attachment_names, list):
+            return {"error": "Invalid attachment_names", "code": 400}
+        
+        try:
+            result = cal_tokens(username, attachment_names, deploy_model)
+            return {
+                "total_tokens": result.get("total_tokens", 0),
+                "file_tokens": result.get("file_tokens", {}),
+                "success": result.get("success", False),
+                "deploy_model": deploy_model,
+                "code": 200
+            }
+        except Exception as e:
+            return {
+                "error": str(e),
+                "total_tokens": 0,
+                "success": False,
+                "code": 500
+            }
+
+
 system_api.add_resource(SessionManagement, "/session_management")
 system_api.add_resource(FileManagement, "/upload_file")
 system_api.add_resource(Test1, "/test1")
 system_api.add_resource(TestMultiFile, "/test_multi_file")
+system_api.add_resource(CheckToken, "/check_token")
