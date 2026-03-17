@@ -22,33 +22,13 @@ class FileOperation:
             for page_index in range(len(doc)):
                 if page_index not in is_content:
                     continue
-                # if img:= doc[page_index].get_images(full=True):
-                #     xref = img[-1][0]
-                #     base_image = doc.extract_image(xref)
-                #     image_bytes = base_image["image"]
-                #     img = Image.open(io.BytesIO(image_bytes))
-                #     buffered = io.BytesIO()
-                #     img.save(buffered, format="PNG")
-                #     img = base64.b64encode(buffered.getvalue()).decode()
-                #     base64_img.append(img)
-                # else:
-                # page = doc[page_index]
-                # pix = page.get_pixmap(dpi=500)
-                # img = Image.open(io.BytesIO(pix.tobytes("png")))
-                # buffered = io.BytesIO()
-                # img.save(buffered, format="PNG")
-                # img = base64.b64encode(buffered.getvalue()).decode()
-                # base64_img.append(img)
-                # 建议改 dpi 为 150 或用缩放矩阵控制分辨率
+
                 page = doc[page_index]
                 pix = page.get_pixmap(dpi=150)
-
-                # 直接拿 PNG 字节，不要再二次转换
                 img_bytes = pix.tobytes("png")
-
-                # 转 base64
                 img_b64 = base64.b64encode(img_bytes).decode()
                 base64_img.append(img_b64)
+
         return base64_img
 
     @staticmethod
@@ -79,15 +59,18 @@ class FileOperation:
                         final_text.append(text)
                     else:
                         is_content.append(page.page_number - 1)
+
             if tables:
                 try:
                     df = "\n".join(pd.DataFrame(table[1:], columns=table[0]).to_json(force_ascii=False) for table in tables)
                 except:
                     df = json.dumps(tables)
+
             if final_text:
                 final_text = " ".join(final_text) + "\n"
             else:
                 final_text = ""
+
         return final_text + df, is_content
 
     @staticmethod
@@ -104,11 +87,13 @@ class FileOperation:
                 table_data.append(row_data)
             if table_data:
                 tables.append(table_data)
+
         if tables:
             try:
                 df = pd.DataFrame(tables[0][1:], columns=tables[0][0]).to_json(force_ascii=False)
             except:
                 df = json.dumps(tables, ensure_ascii=False)
+
         return text.strip() + df
 
     @staticmethod
@@ -121,7 +106,6 @@ class FileOperation:
                 img = Image.open(io.BytesIO(image))
                 buffered = io.BytesIO()
                 img.save(buffered, format="PNG")
-                # save pages
                 img_b64 = base64.b64encode(buffered.getvalue()).decode()
                 base64_img.append(img_b64)
         return base64_img
@@ -141,105 +125,148 @@ class FileOperation:
             pdf_byte_path = pdf_buffer.getvalue()
         return pdf_byte_path
 
+    # -------------------------
+    #  修复图片文件名丢失的关键函数
+    # -------------------------
     @staticmethod
-    def extract_picture(picture_path):
-        base64_img = []
-        img = Image.open(picture_path)
-        buffered = io.BytesIO()
-        img.save(buffered, format="PNG")
-        img = base64.b64encode(buffered.getvalue()).decode()
-        base64_img.append(img)
-        return base64_img
+    def extract_picture(file_stream, file_name):
+        """读取图片流并返回 base64 + 文件名"""
+        try:
+            file_stream.seek(0)
+            raw = file_stream.read()
+            img_b64 = base64.b64encode(raw).decode()
 
+            return {
+                "images": [img_b64],       # 保持 images 仅 base64，不破坏 AI 输入结构
+                "filenames": [file_name]   # 修复：统一使用 filenames
+            }
+        except Exception as e:
+            return {
+                "images": [],
+                "filenames": [file_name],
+                "error": str(e)
+            }
+
+    # -------------------------
+    #        主入口
+    # -------------------------
     def __call__(self, username: str, attachment_names: list):
         if not isinstance(attachment_names, list):
             return {"message": "Invalid attachment_names format", "status": 400}
-        else:
-            results = {}
-            for attachment_name in attachment_names:
+        
+        results = {}
+        for attachment_name in attachment_names:
+            try:
                 file_extension = attachment_name.rsplit(".", 1)[1].lower()
                 blob_client = current_app.container_client.get_blob_client(f"{username}/{attachment_name}")
                 stream = blob_client.download_blob().readall()
                 file_stream = io.BytesIO(stream)
                 encoding = chardet.detect(stream)["encoding"]
-
+                # -------- TXT --------
                 if file_extension == "txt":
                     results[attachment_name] = {
                         "text": stream.decode(encoding),
-                        "images": []
+                        "images": [],
+                        "filenames": [attachment_name]
                     }
 
+                # -------- CSV --------
                 elif file_extension == "csv":
                     df = pd.read_csv(file_stream, encoding=encoding)
                     results[attachment_name] = {
                         "text": df.to_json(force_ascii=False),
-                        "images": []
+                        "images": [],
+                        "filenames": [attachment_name]
                     }
 
+                # -------- JSON --------
                 elif file_extension == "json":
                     results[attachment_name] = {
                         "text": stream.decode(encoding),
-                        "images": []
+                        "images": [],
+                        "filenames": [attachment_name]
                     }
 
+                # -------- Excel --------
                 elif file_extension in ["xlsx", "xls"]:
                     try:
                         if file_extension == "xlsx":
                             df = pd.read_excel(file_stream, engine="openpyxl")
-                        elif file_extension == "xls":
-                            # 需要安装 pip install xlrd==1.2.0
-                            df = pd.read_excel(file_stream, engine="xlrd")
                         else:
-                            raise ValueError("Unsupported Excel file type")
+                            df = pd.read_excel(file_stream, engine="xlrd")
                         results[attachment_name] = {
                             "text": df.to_json(force_ascii=False),
-                            "images": []
+                            "images": [],
+                            "filenames": [attachment_name]     # ⬅️ 修复 EXCEL 也加 filenames
                         }
                     except Exception as e:
                         results[attachment_name] = {
                             "text": f"Failed to read Excel file: {str(e)}",
-                            "images": []
+                            "images": [],
+                            "filenames": [attachment_name]
                         }
 
-                # elif file_extension == "pdf":
-                #     pdf_text, page_num = self.extract_text_from_pdf(stream)
-                #     pdf_images = self.extract_images_from_pdf(stream, page_num)
-                #     results[attachment_name] = {
-                #         "text": pdf_text,
-                #         "images": pdf_images
-                #     }
+                # -------- PDF --------
                 elif file_extension == "pdf":
-                    pdf_stream = io.BytesIO(stream)  # 二进制转 BytesIO
+                    pdf_stream = io.BytesIO(stream)
                     pdf_text, page_num = self.extract_text_from_pdf(stream)
                     pdf_images = self.extract_images_from_pdf(pdf_stream, page_num)
+
+                    # ⬅️ PDF 多图 → 仍然只有 1 个文件名
                     results[attachment_name] = {
                         "text": pdf_text,
-                        "images": pdf_images
+                        "images": pdf_images,
+                        "filenames": [attachment_name]
                     }
 
+                # -------- Word DOCX --------
                 elif file_extension == "docx":
                     word_text = self.extract_text_from_word(file_stream)
                     try:
                         word_images = self.extract_images_from_word(file_stream)
                     except:
                         word_images = []
+
+                    # ⬅️ Word 多图 → 仍然只有 1 个文件名（文件是一个）
                     results[attachment_name] = {
                         "text": word_text,
-                        "images": word_images
+                        "images": word_images,
+                        "filenames": [attachment_name]
                     }
 
+                # -------- 图片 JPG/PNG --------
                 elif file_extension in ["jpg", "jpeg", "png"]:
-                    images = self.extract_picture(file_stream)
+                    pic = FileOperation.extract_picture(file_stream, attachment_name)
+                    print(f"🔍 DEBUG: PNG处理结果 - 文件名: {attachment_name}, filenames: {pic.get('filenames', [])}")
+
+                    # ⬅️ 完整统一格式：text + images + filenames
+                    # ⬅️ 支持多张图片拼接 filenames（即便未来支持多图片上传）
+                    filenames = pic["filenames"]
+                    if isinstance(filenames, str):
+                        filenames = [filenames]
+
                     results[attachment_name] = {
-                        "text": "",
-                        "images": images
+                        "text": f"图片文件: {attachment_name}",
+                        "images": pic["images"],         # base64 list
+                        "filenames": filenames           # 确保一定是 list
                     }
 
+                # -------- 不支持类型 --------
                 else:
                     results[attachment_name] = {
                         "text": f"Unsupported file type: {file_extension}",
-                        "images": []
+                        "images": [],
+                        "filenames": [attachment_name]
                     }
+
+            except Exception as e:
+                # 处理单个文件的错误，不影响其他文件
+                results[attachment_name] = {
+                    "text": f"Error processing file: {str(e)}",
+                    "images": [],
+                    "filenames": [],
+                    "error": str(e)
+                }
 
         return results
 
@@ -256,6 +283,7 @@ MODEL_TOKEN_LIMIT = {
     "gpt-4-turbo": 600000,
     "gpt-35-turbo": 16384,
     "gpt-3.5-turbo": 16384,
+    "gpt-5.2": 600000,
 }
 
 # ========================
@@ -276,9 +304,15 @@ def cal_tokens(username: str, attachment_names: list, deploy_model: str = "gpt-4
 
     try:
         try:
-            encoding = tiktoken.encoding_for_model(deploy_model)
-        except KeyError:
-            encoding = tiktoken.encoding_for_model("gpt-4")
+            if deploy_model in ("gpt-4o", "gpt-4o-mini", "gpt-5.2"):
+                encoding = tiktoken.get_encoding("o200k_base")
+            else:
+                encoding = tiktoken.encoding_for_model(deploy_model)
+        except Exception:
+            try:
+                encoding = tiktoken.get_encoding("o200k_base")
+            except Exception:
+                encoding = tiktoken.encoding_for_model("gpt-4")
 
         total_tokens = 0
         file_tokens = {}
@@ -353,11 +387,9 @@ def _estimate_tokens_fast(blob_client, file_extension: str, encoding):
 
         # === PDF 文件（重点优化） ===
         if file_extension == "pdf":
-            # 下载前 512KB 样本进行结构分析
             sample_len = min(512 * 1024, file_size)
             sample_data = blob_client.download_blob(offset=0, length=sample_len).readall()
 
-            # 尝试读取 PDF 结构（部分加载即可）
             try:
                 doc = fitz.open(stream=sample_data, filetype="pdf")
                 n_pages = len(doc)
@@ -366,32 +398,32 @@ def _estimate_tokens_fast(blob_client, file_extension: str, encoding):
                     n_images += len(page.get_images(full=True))
                 doc.close()
             except Exception:
-                n_pages, n_images = 1, 0  # 解析失败，保守估算
+                n_pages, n_images = 0, 0
 
-            # 图像页比例
-            img_ratio = min(n_images / max(n_pages, 1), 1.0)
+            pages_est = n_pages if n_pages > 0 else 0
+            if n_pages > 0:
+                img_ratio_est = min(n_images / max(n_pages, 1), 1.0)
+            else:
+                images_hint = sample_data.count(b"/Image") + sample_data.count(b"/Subtype /Image")
+                pages_hint = sample_data.count(b"/Type /Page")
+                if pages_hint > 0:
+                    pages_est = pages_hint
+                    img_ratio_est = min(images_hint / max(pages_hint, 1), 1.0)
+                else:
+                    img_ratio_est = 0.7 if file_size > 2 * 1024 * 1024 else 0.5
+                    avg_bytes_per_page = 200 * 1024 if img_ratio_est >= 0.6 else 40 * 1024
+                    pages_est = max(1, int(file_size / avg_bytes_per_page))
 
-            # === 估算逻辑 ===
-            # 1 token ≈ 4 字节（纯文本页）
-            # 图片页约等价于 base64 转换后每 3 字节→4字节，约 ×1.33 token 消耗
-            base_text_ratio = 1 - img_ratio
-            base_image_ratio = img_ratio * 1.33
+            text_tpp = 650
+            image_tpp = 220
+            tokens_pages = int(pages_est * ((1 - img_ratio_est) * text_tpp + img_ratio_est * image_tpp))
 
-            # 平均有效比例（非线性缓冲）
-            effective_ratio = 4 * base_text_ratio + 6 * base_image_ratio  # 偏大以防低估
+            if file_size > 5 * 1024 * 1024 and img_ratio_est >= 0.6:
+                tokens_pages = int(tokens_pages * 0.8)
+            if file_size > 20 * 1024 * 1024 and img_ratio_est >= 0.7:
+                tokens_pages = int(tokens_pages * 0.7)
 
-            # 经验衰减系数：越大文件→单位token/byte越低（考虑压缩率）
-            decay = 1.0
-            if file_size > 1 * 1024 * 1024:  # >1MB
-                decay = 0.6
-            if file_size > 3 * 1024 * 1024:  # >3MB
-                decay = 0.5
-
-            tokens = int(file_size / effective_ratio * decay)
-
-            # 限制范围（最小2k，最大120k）
-            tokens = int(file_size / effective_ratio * decay)
-            return tokens
+            return max(200, tokens_pages)
 
         # === 文本类（TXT/JSON/CSV） ===
         if file_extension in ["txt", "json", "csv"]:
@@ -403,13 +435,25 @@ def _estimate_tokens_fast(blob_client, file_extension: str, encoding):
                 return int(file_size / 4)
             sample_tokens = len(encoding.encode(sample_text))
             token_density = sample_tokens / max(len(sample_text), 1)
+            token_density = max(0.05, min(token_density, 1.0))
             avg_bytes_per_char = max(sample_size / max(len(sample_text), 1), 1.0)
             estimated_chars = file_size / avg_bytes_per_char
             return int(estimated_chars * token_density)
 
         # === Excel / Word 文件 ===
         if file_extension in ["xlsx", "xls", "docx"]:
-            return int(file_size / 6)
+            sample_size = min(256 * 1024, file_size)
+            sample_data = blob_client.download_blob(offset=0, length=sample_size).readall()
+            markers = [b"word/media", b"xl/media", b'ContentType="image/', b"/image", b"image/jpeg", b"image/png"]
+            image_markers = 0
+            for m in markers:
+                image_markers += sample_data.count(m)
+            heavy_images = image_markers >= 2 or (file_size > 3 * 1024 * 1024 and image_markers > 0)
+            if file_extension == "docx":
+                divisor = 14 if heavy_images else 10
+            else:
+                divisor = 16 if heavy_images else 12
+            return max(200, int(file_size / divisor))
 
         # === 其他未知类型 ===
         return int(file_size / 8)

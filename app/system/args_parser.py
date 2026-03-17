@@ -61,6 +61,7 @@ class SessionPutParser(SessionAddParser):
         self.parser.add_argument('attachment_name', type=str, action="append", help="添付ファイル名")
         self.parser.add_argument('content', type=str, help="セッションの内容をご確認ください")
         self.parser.add_argument('session_id', type=str)
+        self.parser.add_argument('deploy_model', type=str, help="部署モデル名（デフォルト：gpt-5.2）")
 
 
 class FileParser(BaseArgsParser):
@@ -83,5 +84,41 @@ class CheckTokenParser(BaseArgsParser):
         self.parser.add_argument('username', type=str, required=True, help="ユーザー名")
         self.parser.add_argument('attachment_names', type=str, action="append", required=True, help="添付ファイル名リスト")
         self.parser.add_argument('deploy_model', type=str, help="部署モデル名（デフォルト：gpt-4o）")
+
+
+class TaskQueuePostParser(BaseArgsParser):
+    def __init__(self):
+        super().__init__()
+        self.parser.add_argument('username', type=str, required=True, help="ユーザー名")
+        self.parser.add_argument('queue_name', type=str, required=True, help="キュー名")
+        self.parser.add_argument('message', type=str, required=True, help="送信メッセージ")
+
+
+class TaskQueueDeleteParser(BaseArgsParser):
+    def __init__(self):
+        super().__init__()
+        self.parser.add_argument('username', type=str, required=True, location=['json', 'args'], help="ユーザー名")
+        self.parser.add_argument('queue_name', type=str, required=True, location=['json', 'args'], help="キュー名")
+        self.parser.add_argument('message_id', type=str, required=True, location=['json', 'args'], help="メッセージID")
+        self.parser.add_argument('pop_receipt', type=str, location=['json', 'args'], help="pop receipt")
+
+
+class QueueStateGetParser(BaseArgsParser):
+    def __init__(self):
+        super().__init__()
+        self.parser.add_argument('username', type=str, location='args')
+        self.parser.add_argument('queue_name', type=str, location='args')
+        self.parser.add_argument('message_id', type=str, location='args')
+        self.parser.add_argument('status', type=str, location='args')
+
+
+class QueueStatePostParser(BaseArgsParser):
+    def __init__(self):
+        super().__init__()
+        self.parser.add_argument('username', type=str, required=True, help="ユーザー名")
+        self.parser.add_argument('queue_name', type=str, required=True, help="キュー名")
+        self.parser.add_argument('message', type=str, required=True, help="メッセージ内容")
+        self.parser.add_argument('message_id', type=str, required=True, help="メッセージID")
+        self.parser.add_argument('status', type=str, required=True, help="ステータス")
 
 
