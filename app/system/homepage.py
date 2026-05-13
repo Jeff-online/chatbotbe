@@ -11,8 +11,11 @@ from flask import current_app
 from datetime import datetime, timedelta
 from utils.file_utils import FileOperation, cal_tokens
 from .args_parser import CheckTokenParser
+from azure.core.exceptions import ResourceExistsError
 from werkzeug.utils import secure_filename
 from common.common_resource import GlobalResource, Resource
+import json
+from .task_queue import TaskQueue, QueueState, QueueConcurrencyLock
 logger = logging.getLogger(__name__)
 
 
@@ -140,9 +143,24 @@ class SessionManagement(GlobalResource):
                         history_data = session_info["S_info"]["content"]
 
                         try:
+                            # Before calling get_answer, update status to 'processing'
+                            if attachment_names:
+                                # 批量更新状态为 processing，提高效率
+                                file_list = attachment_names if isinstance(attachment_names, list) else [attachment_names]
+                                QueueState.update_statuses_by_filenames(username, file_list, "processing", session_id=session_id)
+                            
                             content = clue + content
                             content, response_ai, used_model = self.get_answer(file_content, content, dialogue_history, history_data, deploy_model)
+                            
+                            # After AI finishes, update status to 'parsed'
+                            if attachment_names:
+                                # 批量更新状态为 parsed
+                                QueueState.update_statuses_by_filenames(username, file_list, "parsed", session_id=session_id)
                         except Exception as e:
+                            # Update to 'failed' on error
+                            if attachment_names:
+                                for filename in (attachment_names if isinstance(attachment_names, list) else [attachment_names]):
+                                    QueueState.update_status_by_filename(username, filename, "failed")
                             return {"message": str(e), "status": 404}
 
                         history_data.append([content, response_ai])
@@ -202,61 +220,121 @@ class SessionManagement(GlobalResource):
                 history_message = {"role": "user", "content": data[0]}
                 question.append(history_message)
 
-        # 拼接多个文件内容
+        # 1. 提取文本与图片
         merged_texts = []
         merged_images = []
         if file_content:
             for fname, fdata in file_content.items():
-                if fdata["text"]:
+                if fdata.get("text"):
                     merged_texts.append(f"[{fname}]\n{fdata['text']}")
-                if fdata["images"]:
+                if fdata.get("images"):
                     merged_images.extend(fdata["images"])
 
-        # 整合文本
-        if merged_texts:
-            input_data = "\n\n".join(merged_texts) + "\n\n" + input_data
+        full_text = "\n\n".join(merged_texts) if merged_texts else ""
 
-        # 构造 message
-        if merged_images:
-            message = {"role": "user", "content": [{"type": "text", "text": input_data}]}
-            for base64_img in merged_images:
-                message["content"].append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{base64_img}"}
-                })
-        else:
-            message = {"role": "user", "content": input_data}
-
-        question.append(message)
-
-        # token refresh
+        # 2. Token 刷新与配置
         if time.time() >= current_app.token_expires - 600:
             new_token = current_app.credential.get_token(os.getenv("SCOPE"))
             current_app.openai_token = new_token.token
             current_app.token_expires = new_token.expires_on
+        
         current_app.openai.api_key = current_app.openai_token
         model_key = (deploy_model or current_app.default_model or "gpt-5.2").lower()
         config = current_app.model_configs.get(model_key) or current_app.model_configs.get("gpt-5.2")
         current_app.openai.api_base = config["endpoint"]
         current_app.openai.api_version = config["api_version"]
-        if model_key == "gpt-4o":
-            response = current_app.openai.ChatCompletion.create(
-                deployment_id=config["deployment"],
-                messages=question,
-                max_tokens=4000,
-                temperature=0,
-                seed=42
-            )
+
+        CHUNK_SIZE = 40000
+        # 最多允许的图片数量
+        MAX_IMAGES = 50
+        if len(merged_images) > MAX_IMAGES:
+            logger.warning(f"Image count {len(merged_images)} exceeds max {MAX_IMAGES}, truncating to first {MAX_IMAGES} images.")
+            merged_images = merged_images[:MAX_IMAGES]
+
+        # 场景 A：文件较小，单次请求即可搞定
+        if len(full_text) <= CHUNK_SIZE:
+            print("小文件执行")
+            final_input = full_text + "\n\n" + input_data if full_text else input_data
+            
+            message = {"role": "user", "content": [{"type": "text", "text": final_input}]}
+            if merged_images:
+                for base64_img in merged_images:
+                    message["content"].append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{base64_img}"}
+                    })
+
+            question.append(message)
+
+            try:
+                kwargs = {
+                    "deployment_id": config["deployment"],
+                    "messages": question,
+                    "temperature": 0,
+                    "seed": 42
+                }
+                if model_key == "gpt-4o":
+                    kwargs["max_tokens"] = 8000
+                else:
+                    kwargs["max_completion_tokens"] = 8000
+
+                response = current_app.openai.ChatCompletion.create(**kwargs)
+                answer = response['choices'][0]['message']['content'].strip()
+                return input_data, answer, model_key
+            except Exception as e:
+                logger.error(f"Single chunk processing failed: {str(e)}")
+                raise Exception(f"AI Call failed: {str(e)}")
+
+        # 场景 B：大文件切片循环（安全单线程模式）
         else:
-            response = current_app.openai.ChatCompletion.create(
-                deployment_id=config["deployment"],
-                messages=question,
-                max_completion_tokens=4000,
-                temperature=0,
-                seed=42
-            )
-        answer = response['choices'][0]['message']['content'].strip()
-        return input_data, answer, model_key
+            print("大文件执行")
+            chunks = [full_text[i:i + CHUNK_SIZE] for i in range(0, len(full_text), CHUNK_SIZE)]
+            final_answer = ""
+            
+            MAX_CHUNKS = 5
+            processed_chunks = chunks[:MAX_CHUNKS]
+
+            for idx, chunk in enumerate(processed_chunks):
+                current_question = list(question) 
+                chunk_context = f"[文件内容第 {idx+1}/{len(processed_chunks)} 部分]:\n{chunk}\n\n[用户指令]:\n{input_data}"
+                
+                msg = {"role": "user", "content": [{"type": "text", "text": chunk_context}]}
+                # 只在第一段附加图片，省 Token
+                if merged_images and idx == 0:
+                    for base64_img in merged_images:
+                        msg["content"].append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{base64_img}"}
+                        })
+                
+                current_question.append(msg)
+                
+                try:
+                    kwargs = {
+                        "deployment_id": config["deployment"],
+                        "messages": current_question,
+                        "temperature": 0,
+                        "seed": 42
+                    }
+                    if model_key == "gpt-4o":
+                        kwargs["max_tokens"] = 8000
+                    else:
+                        kwargs["max_completion_tokens"] = 8000
+
+                    response = current_app.openai.ChatCompletion.create(**kwargs)
+                    chunk_answer = response['choices'][0]['message']['content'].strip()
+                    final_answer += f"### 第 {idx+1} 部分结果 ###\n{chunk_answer}\n\n"
+                    
+                except Exception as e:
+                    logger.error(f"Chunk {idx+1} failed: {str(e)}")
+                    final_answer += f"### 第 {idx+1} 部分失败 ###\n错误: {str(e)}\n\n"
+            
+            # 如果文件真的太大，被截断了
+            if len(chunks) > MAX_CHUNKS:
+                final_answer += f"\n\n> **系统提示**: 该文件体积过于庞大。为避免处理超时，系统仅为您分析了前 {MAX_CHUNKS} 部分的内容。"
+
+            return_input = f"[系统拆分为 {len(processed_chunks)} 段处理的大型文件]\n" + input_data
+            return return_input, final_answer.strip(), model_key
 
     @staticmethod
     def check_session(session_data):
@@ -297,8 +375,8 @@ class SessionManagement(GlobalResource):
                 if attachment_name:  # 如果列表不为空
                     get_file_content = FileOperation()
                     file_content = get_file_content(username, attachment_name)  # 返回 dict
-                    print(f"🔍 DEBUG: check_name处理结果 - 文件列表: {attachment_name}")
-                    print(f"🔍 DEBUG: file_content keys: {list(file_content.keys()) if file_content else 'None'}")
+                    print(f"DEBUG: check_name处理结果 - 文件列表: {attachment_name}")
+                    print(f"DEBUG: file_content keys: {list(file_content.keys()) if file_content else 'None'}")
         except Exception as e:
             logger.error(f"Error occurred while getting file content: {e}")
             return {"message in the check name function after FileOperation": str(e), "status": 404, "attachment_name_type": type(attachment_name)}
@@ -323,19 +401,74 @@ class FileManagement(GlobalResource):
         file = args.get("file")
         if not username:
             raise messages.UserNameNotExistsError
+
+        # 直接从用户信息中获取最新的 session_id，不再由前端传递
+        logger.info(f"🔍 Fetching user info for username: {username} to get latest session_id")
+        user_data = list(current_app.container.query_items(
+            query=f"SELECT * FROM c WHERE c.username = @username",
+            parameters=[{"name": "@username", "value": username}],
+            enable_cross_partition_query=True
+        ))
+        if not user_data:
+            logger.error(f"❌ User '{username}' not found in database")
+            raise messages.UserNotExistsError
+            
+        user_info = user_data[0]
+        u_sessions = user_info.get("U_session", [])
+        session_id = u_sessions[-1].get("session_id") if u_sessions else None
+        logger.info(f"✅ Found session_id: {session_id} for user: {username}")
+        
         if file and self.allowed_file(file.filename):
             try:
+                # 1. Upload to Blob Storage
                 blob_client = current_app.container_client.get_blob_client(f"{username}/{file.filename}")
                 blob_client.upload_blob(file.stream, overwrite=True)
+                logger.info(f"✅ File '{file.filename}' uploaded successfully to Azure Blob Storage")
 
-                logger.info(f"File '{file.filename}' uploaded successfully with description")
+                # 2. Determine Queue (Light vs Heavy)
+                attachment_names = [file.filename]
+                token_result = cal_tokens(username, attachment_names)
+                total_tokens = token_result.get("total_tokens", 0)
+                logger.info(f"📊 Token estimation for {file.filename}: {total_tokens}")
+                
+                queue_name = "heavy-queue" if total_tokens > TaskQueue.HEAVY_QUEUE_THRESHOLD else "light-queue"
+                
+                # 3. Create Cosmos DB record ONLY (status: uploaded)
+                create_time = datetime.now().isoformat()
+                status = "uploaded"
+                
+                message_payload = {
+                    "queue_name": queue_name,
+                    "user-name": username,
+                    "create_time": create_time,
+                    "status": status,
+                    "message": f"File uploaded: {file.filename}",
+                    "attachment_names": attachment_names,
+                    "session_id": session_id
+                }
+                message_json = json.dumps(message_payload)
+                
+                # Create DB record ONLY
+                logger.info(f"📝 Creating database record for file: {file.filename}")
+                queue_state_id = QueueState.create(
+                    username=username,
+                    queue_name=queue_name,
+                    message=message_json,
+                    status=status,
+                    session_id=session_id
+                )
+                logger.info(f"✅ Successfully created database record: {queue_state_id}")
+                
                 return {
-                    'message': f"File '{file.filename}' uploaded successfully with description",
+                    'message': f"File '{file.filename}' uploaded successfully",
                     'file_path': f"{username}/{file.filename}",
-                    'filename': file.filename,  # 明确返回文件名
+                    'filename': file.filename,
+                    'queue_name': queue_name,
+                    'queue_state_id': queue_state_id,
                     "code": 200
                 }
             except Exception as e:
+                logger.error(f"❌ Error during file upload processing: {str(e)}", exc_info=True)
                 return {'msg': f"Azure upload failed: {str(e)}", "code": 417}
 
         return {'msg': 'Invalid file type', "code": 400}
@@ -375,22 +508,81 @@ class FileManagement(GlobalResource):
         args = args_parser.parser.parse_args()
         username = args.get("username")
         filename = args.get("filename")
+        session_id = args.get("session_id")
         if not username:
             raise messages.UserNameNotExistsError
         if filename:
             try:
-                blob_client = current_app.container_client.get_blob_client(f"{username}/{filename}")
-                blob_client.delete_blob()
-                logger.info( f"user: {filename}\n option: File deleted successfully")
+                # 1. Delete Queue Message and Cosmos Record (Filtered by session_id if provided)
+                try:
+                    QueueState.delete_by_filename(username, filename, session_id)
+                    logger.info(f"✅ Deleted queue records and messages for user {username}, file {filename}, session {session_id}")
+                except Exception as q_err:
+                    logger.error(f"❌ Failed to delete queue records for file {filename}: {q_err}")
+
+                # 2. Check if any other records exist for this user and filename before deleting Blob
+                # If multiple sessions use the same file, we shouldn't delete the blob yet
+                query = "SELECT VALUE count(1) FROM c WHERE c.type = 'queue_state' AND c.username = @username"
+                params = [{"name": "@username", "value": username}]
+                
+                # Check message content for the filename
+                # Note: Cosmos DB query for array contains might be complex here, 
+                # but we can fetch and check or use a simpler check if we know the structure.
+                # Since we just deleted the specific session's record, we check if ANY remains.
+                
+                remaining_items = list(current_app.container_task_queue.query_items(
+                    query=query, 
+                    parameters=params, 
+                    enable_cross_partition_query=True
+                ))
+                
+                # To be precise, we need to check if any record still has this filename in attachment_names
+                query_remaining = "SELECT * FROM c WHERE c.type = 'queue_state' AND c.username = @username"
+                all_user_records = list(current_app.container_task_queue.query_items(
+                    query=query_remaining, 
+                    parameters=params, 
+                    enable_cross_partition_query=True
+                ))
+                
+                file_still_referenced = False
+                for rec in all_user_records:
+                    msg_data = rec.get("message", {})
+                    if isinstance(msg_data, str):
+                        try: msg_data = json.loads(msg_data)
+                        except: continue
+                    if filename in msg_data.get("attachment_names", []):
+                        file_still_referenced = True
+                        break
+                
+                if not file_still_referenced:
+                    # No more references, safe to delete Blob
+                    blob_client = current_app.container_client.get_blob_client(f"{username}/{filename}")
+                    blob_client.delete_blob()
+                    logger.info(f"user: {username}\n option: File '{filename}' deleted from blob (no more references)")
+                else:
+                    logger.info(f"Skipping Blob deletion for '{filename}' as it is still referenced in other sessions")
+
                 return {"msg": f"{filename}ファイルの削除が成功しました", "code": 200}
             except Exception as e:
                 return {"msg": f"{filename}ファイルが存在しないか、削除された", "code": 200}
         else:
             try:
+                # Delete all blobs for user
                 blobs_to_delete = list(current_app.container_client.list_blobs(name_starts_with=username))
                 if blobs_to_delete:
                     current_app.container_client.delete_blobs(*[blob.name for blob in blobs_to_delete])
-                    return {"msg": f"{filename}ファイルの削除が成功しました", "code": 200}
+                    
+                    # Also delete all queue records/messages for this user
+                    # We can iterate through blobs or just call a general delete for the user
+                    for blob in blobs_to_delete:
+                        # Extract just the filename from blob.name (which is "username/filename")
+                        fname = blob.name.split("/")[-1] if "/" in blob.name else blob.name
+                        try:
+                            QueueState.delete_by_filename(username, fname)
+                        except:
+                            pass
+                            
+                    return {"msg": "すべてのファイルの削除が成功しました", "code": 200}
                 else:
                     return {"msg": "ファイルが存在しないか、削除された", "code": 200}
             except Exception as e:
@@ -472,5 +664,3 @@ class CheckToken(GlobalResource):
 system_api.add_resource(SessionManagement, "/session_management")
 system_api.add_resource(FileManagement, "/upload_file")
 system_api.add_resource(CheckToken, "/check_token")
-
-
