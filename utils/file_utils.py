@@ -31,47 +31,81 @@ class FileOperation:
 
         return base64_img
 
-    @staticmethod
-    def extract_text_from_pdf(pdf_path):
-        pdf_bytes = io.BytesIO(pdf_path)
+    def extract_text_from_pdf(self, stream):
+        # 检查是否为bytes对象，如果是则转换为BytesIO对象
+        if isinstance(stream, bytes):
+            stream = io.BytesIO(stream)
+        elif hasattr(stream, 'read'):  # 已经是文件对象
+            if hasattr(stream, 'seek'):
+                stream.seek(0)
+            else:  # 如果是不可seek的对象，转换为BytesIO
+                content = stream.read()
+                stream = io.BytesIO(content)
+        
         is_content = []
         final_text = []
-        tables = []
         df = ""
-        with pdfplumber.open(pdf_bytes) as pdf:
-            for page in pdf.pages:
-                table = page.extract_table()
-                if table and any(any(once) for once in table):
-                    tables.append(table)
-                    table_bboxes = [pos.bbox for pos in page.find_tables()]
-                    filtered_text = page.extract_words()
-                    for word in filtered_text:
-                        x0, y0, x1, y1 = word["x0"], word["top"], word["x1"], word["bottom"]
-                        inside_table = any(
-                            t_x0 <= x0 <= t_x1 and t_y0 <= y0 <= t_y1
-                            for (t_x0, t_y0, t_x1, t_y1) in table_bboxes
-                        )
-                        if not inside_table:
-                            final_text.append(word["text"])
-                else:
-                    text = page.extract_text()
-                    if text and len(text) > 10:
-                        final_text.append(text)
+        chars_count = 0
+        max_chars = 100000  # 限制总字符数防止内存溢出
+
+        try:
+            with fitz.open(stream=stream, filetype="pdf") as doc:
+                for i in range(len(doc)):
+                    if chars_count >= max_chars:
+                        break
+
+                    try:
+                        text = doc[i].get_text("text")
+                    except Exception:
+                        text = ""
+
+                    if text and len(text.strip()) > 10:
+                        text = text.strip()
+                        remaining = max_chars - chars_count
+                        if len(text) <= remaining:
+                            final_text.append(text)
+                            chars_count += len(text)
+                        else:
+                            final_text.append(text[:remaining])
+                            chars_count = max_chars
+                            break
                     else:
-                        is_content.append(page.page_number - 1)
+                        is_content.append(i)
+        except Exception:
+            # fitz 解析失败时回退到 pdfplumber，但这里只做最小文本提取
+            if hasattr(stream, 'seek'):
+                stream.seek(0)
+            try:
+                with pdfplumber.open(stream) as pdf:
+                    for i, page in enumerate(pdf.pages):
+                        if chars_count >= max_chars:
+                            break
+                        try:
+                            text = page.extract_text()
+                        except Exception:
+                            text = ""
 
-            if tables:
-                try:
-                    df = "\n".join(pd.DataFrame(table[1:], columns=table[0]).to_json(force_ascii=False) for table in tables)
-                except:
-                    df = json.dumps(tables)
-
-            if final_text:
-                final_text = " ".join(final_text) + "\n"
-            else:
-                final_text = ""
-
-        return final_text + df, is_content
+                        if text and len(text) > 10:
+                            remaining = max_chars - chars_count
+                            if len(text) <= remaining:
+                                final_text.append(text)
+                                chars_count += len(text)
+                            else:
+                                final_text.append(text[:remaining])
+                                chars_count = max_chars
+                                break
+                        else:
+                            is_content.append(i)
+            except Exception:
+                return "", []
+        
+        # 最终文本拼接
+        if final_text:
+            final_text_str = " ".join(final_text) + "\n"
+        else:
+            final_text_str = ""
+        
+        return final_text_str + df, is_content
 
     @staticmethod
     def extract_text_from_word(docx_path):
@@ -237,7 +271,7 @@ class FileOperation:
                 # -------- 图片 JPG/PNG --------
                 elif file_extension in ["jpg", "jpeg", "png"]:
                     pic = FileOperation.extract_picture(file_stream, attachment_name)
-                    print(f"🔍 DEBUG: PNG处理结果 - 文件名: {attachment_name}, filenames: {pic.get('filenames', [])}")
+                    print(f"DEBUG: PNG处理结果 - 文件名: {attachment_name}, filenames: {pic.get('filenames', [])}")
 
                     # ⬅️ 完整统一格式：text + images + filenames
                     # ⬅️ 支持多张图片拼接 filenames（即便未来支持多图片上传）
@@ -284,6 +318,7 @@ MODEL_TOKEN_LIMIT = {
     "gpt-35-turbo": 16384,
     "gpt-3.5-turbo": 16384,
     "gpt-5.2": 600000,
+    "gpt-5.4mini": 600000,
 }
 
 # ========================
@@ -304,7 +339,8 @@ def cal_tokens(username: str, attachment_names: list, deploy_model: str = "gpt-4
 
     try:
         try:
-            if deploy_model in ("gpt-4o", "gpt-4o-mini", "gpt-5.2"):
+            # 仅当模型为 gpt-4 或 gpt-5 时忽略小版本
+            if deploy_model.startswith("gpt-4") or deploy_model.startswith("gpt-5"):
                 encoding = tiktoken.get_encoding("o200k_base")
             else:
                 encoding = tiktoken.encoding_for_model(deploy_model)
@@ -340,7 +376,7 @@ def cal_tokens(username: str, attachment_names: list, deploy_model: str = "gpt-4
 
             except Exception as e:
                 file_tokens[attachment_name] = 0
-                print(f"⚠️ Error processing {attachment_name}: {e}")
+                print(f"Error processing {attachment_name}: {e}")
 
         return {
             "total_tokens": total_tokens,
@@ -370,7 +406,7 @@ def _cache_with_limit(key: str, value: int):
 # ========================
 def _estimate_tokens_fast(blob_client, file_extension: str, encoding):
     """
-    改进版：更精确估算 PDF（含 base64 图像流）的 token 数量
+    针对 5MB 以内小文件优化的 Token 估算函数
     """
     try:
         blob_properties = blob_client.get_blob_properties()
@@ -378,88 +414,70 @@ def _estimate_tokens_fast(blob_client, file_extension: str, encoding):
 
         # === 图片类文件 ===
         if file_extension in ["jpg", "jpeg", "png"]:
-            if file_size < 100 * 1024:
-                return 100
-            elif file_size < 500 * 1024:
-                return 200
-            else:
-                return 300
+            if file_size < 100 * 1024: return 100
+            elif file_size < 500 * 1024: return 200
+            else: return 300
 
-        # === PDF 文件（重点优化） ===
+        # === PDF 文件（由于限额 5MB，直接读取全量数据进行精确解析） ===
         if file_extension == "pdf":
-            sample_len = min(512 * 1024, file_size)
-            sample_data = blob_client.download_blob(offset=0, length=sample_len).readall()
-
+            # 5MB 以内直接全量下载，确保解析 100% 成功
+            full_data = blob_client.download_blob().readall()
+            
             try:
-                doc = fitz.open(stream=sample_data, filetype="pdf")
-                n_pages = len(doc)
-                n_images = 0
-                for page in doc:
-                    n_images += len(page.get_images(full=True))
-                doc.close()
+                with fitz.open(stream=full_data, filetype="pdf") as doc:
+                    n_pages = len(doc)
+                    n_images = 0
+                    # 快速检查前 10 页的图像密度作为采样
+                    for i in range(min(10, n_pages)):
+                        n_images += len(doc[i].get_images(full=True))
+                    
+                    img_ratio = min(n_images / max(min(10, n_pages), 1), 1.0)
             except Exception:
-                n_pages, n_images = 0, 0
+                # 如果 fitz 失败，回退到特征匹配
+                pages_hint = full_data.count(b"/Type /Page")
+                images_hint = full_data.count(b"/Subtype /Image")
+                n_pages = max(1, pages_hint)
+                img_ratio = min(images_hint / n_pages, 1.0) if n_pages > 0 else 0.5
 
-            pages_est = n_pages if n_pages > 0 else 0
-            if n_pages > 0:
-                img_ratio_est = min(n_images / max(n_pages, 1), 1.0)
-            else:
-                images_hint = sample_data.count(b"/Image") + sample_data.count(b"/Subtype /Image")
-                pages_hint = sample_data.count(b"/Type /Page")
-                if pages_hint > 0:
-                    pages_est = pages_hint
-                    img_ratio_est = min(images_hint / max(pages_hint, 1), 1.0)
-                else:
-                    img_ratio_est = 0.7 if file_size > 2 * 1024 * 1024 else 0.5
-                    avg_bytes_per_page = 200 * 1024 if img_ratio_est >= 0.6 else 40 * 1024
-                    pages_est = max(1, int(file_size / avg_bytes_per_page))
-
-            text_tpp = 650
-            image_tpp = 220
-            tokens_pages = int(pages_est * ((1 - img_ratio_est) * text_tpp + img_ratio_est * image_tpp))
-
-            if file_size > 5 * 1024 * 1024 and img_ratio_est >= 0.6:
-                tokens_pages = int(tokens_pages * 0.8)
-            if file_size > 20 * 1024 * 1024 and img_ratio_est >= 0.7:
-                tokens_pages = int(tokens_pages * 0.7)
-
-            return max(200, tokens_pages)
+            # 调优后的权重：文字页 500 tokens，图片页 300 tokens
+            text_tpp = 500  
+            image_tpp = 300 
+            tokens_est = int(n_pages * ((1 - img_ratio) * text_tpp + img_ratio * image_tpp))
+            
+            # 针对 5MB 以内的 PDF，防止结构化数据导致的虚高
+            return max(150, tokens_est)
 
         # === 文本类（TXT/JSON/CSV） ===
         if file_extension in ["txt", "json", "csv"]:
-            sample_size = min(4096, file_size)
+            # 5MB 以内直接读取前 1MB 采样即可
+            sample_size = min(1024 * 1024, file_size)
             sample_data = blob_client.download_blob(offset=0, length=sample_size).readall()
             encoding_type = chardet.detect(sample_data)["encoding"] or "utf-8"
             sample_text = sample_data.decode(encoding_type, errors="ignore")
-            if not sample_text:
-                return int(file_size / 4)
+            
+            if not sample_text: return int(file_size / 4)
+            
             sample_tokens = len(encoding.encode(sample_text))
             token_density = sample_tokens / max(len(sample_text), 1)
-            token_density = max(0.05, min(token_density, 1.0))
-            avg_bytes_per_char = max(sample_size / max(len(sample_text), 1), 1.0)
+            # 修正密度：通常 1 个字符约 0.5~0.8 token (对于 tiktoken)
+            token_density = max(0.1, min(token_density, 1.2))
+            
+            avg_bytes_per_char = max(len(sample_data) / max(len(sample_text), 1), 1.0)
             estimated_chars = file_size / avg_bytes_per_char
             return int(estimated_chars * token_density)
 
         # === Excel / Word 文件 ===
         if file_extension in ["xlsx", "xls", "docx"]:
-            sample_size = min(256 * 1024, file_size)
-            sample_data = blob_client.download_blob(offset=0, length=sample_size).readall()
-            markers = [b"word/media", b"xl/media", b'ContentType="image/', b"/image", b"image/jpeg", b"image/png"]
-            image_markers = 0
-            for m in markers:
-                image_markers += sample_data.count(m)
-            heavy_images = image_markers >= 2 or (file_size > 3 * 1024 * 1024 and image_markers > 0)
-            if file_extension == "docx":
-                divisor = 14 if heavy_images else 10
-            else:
-                divisor = 16 if heavy_images else 12
-            return max(200, int(file_size / divisor))
+            # 5MB 以内的 Office 文件，通常包含大量 XML 结构，Token 密度较低
+            # 之前 1/10 的比例依然偏高，调大分母
+            divisor = 25 if file_extension == "docx" else 30
+            return max(100, int(file_size / divisor))
 
         # === 其他未知类型 ===
-        return int(file_size / 8)
+        return int(file_size / 10)
 
     except Exception as e:
-        print(f"⚠️ Error estimating tokens: {e}")
+        print(f"Error estimating tokens: {e}")
         return 100
 
 # ========================
@@ -476,4 +494,3 @@ def get_cache_stats():
 if __name__ == '__main__':
     file_get = FileOperation()
     # content = file_get("./", ["9Q311103_(Token：54982).pdf"])
-    # print(content)
